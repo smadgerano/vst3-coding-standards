@@ -1,0 +1,1137 @@
+# Modern Professional Coding Standards for JUCE-Based VST3 Plug-ins
+
+**Version:** 1.0  
+**Generated:** 2026-05-09  
+**Audience:** human developers and agentic coding systems  
+**Scope:** reusable standards for professional JUCE-based audio plug-ins, with VST3 as a required target format
+
+---
+
+## 0. Non-negotiable principles
+
+These rules override convenience, style preference, and agent-generated shortcuts.
+
+1. **The audio callback must be deterministic.** `AudioProcessor::processBlock()` and functions it calls must not allocate, block, wait, log, perform file/network I/O, call GUI APIs, or throw exceptions.
+2. **DSP must be testable outside JUCE.** Put algorithms in SDK-independent classes. JUCE should adapt host buffers, parameters, state, and UI to a core DSP model.
+3. **Parameter IDs and state formats are product contracts.** Do not rename, reorder, remove, or reuse parameter IDs without an explicit migration plan and tests.
+4. **Thread safety is designed, not patched.** Shared mutable state between audio, UI, host, and worker threads must use atomics, immutable snapshots, or bounded lock-free queues with clearly documented ownership.
+5. **No “probably fine” real-time code.** If an operation has unbounded duration, can call the OS, can allocate, or can wait for another thread, it is forbidden on the audio thread.
+6. **Measure before optimizing.** SIMD, approximations, lookup tables, oversampling, and branch removal must be justified by profiling and protected by tests.
+7. **Generated or agent-written code must pass the same gates as human code.** Build, tests, static analysis, sanitizer runs, and VST3 validation are not optional.
+
+---
+
+## 1. Baseline toolchain and dependencies
+
+### 1.1 Language and compiler
+
+- Use **C++20** for project code.
+- Use **MSVC 19.44+ / Visual Studio 2022** as the required Windows compiler baseline.
+- Enable modern conformance switches on MSVC:
+
+```cmake
+target_compile_features(${PROJECT_TARGET} PRIVATE cxx_std_20)
+
+target_compile_options(${PROJECT_TARGET} PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/W4 /permissive- /Zc:__cplusplus /MP>
+)
+```
+
+Recommended but project-dependent:
+
+- `/WX` in CI after third-party warnings are isolated.
+- `/analyze` or C++ Core Guidelines checks in a dedicated CI job.
+- `clang-cl` or Clang builds for additional diagnostics and sanitizer coverage.
+
+Do not rely on compiler extensions unless isolated behind documented compatibility wrappers.
+
+### 1.2 JUCE version
+
+Use the **latest non-preview JUCE SDK** pinned by tag or commit. As of the research pass for this document, JUCE's public release page showed JUCE 8.x with 8.0.12 as the latest listed release. Always verify the current non-preview tag before starting a new project.
+
+Do not track JUCE `master` in production products. Pin a release tag or commit and record it in dependency metadata.
+
+### 1.3 CMake version
+
+For JUCE projects using the current JUCE CMake API, require **CMake 3.22 or newer**. Although some older audio projects used lower CMake versions, current JUCE CMake documentation states that all project types require CMake 3.22+.
+
+Recommended:
+
+```cmake
+cmake_minimum_required(VERSION 3.22...3.30)
+project(MyPlugin VERSION 1.0.0 LANGUAGES CXX)
+```
+
+The user's broad baseline of “CMake 3.14+” is not suitable as a universal minimum for current JUCE CMake projects. Treat 3.14+ only as a legacy lower bound for non-JUCE tooling where supported.
+
+### 1.4 Build system standards
+
+Use CMake presets:
+
+```json
+{
+  "version": 6,
+  "configurePresets": [
+    {
+      "name": "windows-msvc-debug",
+      "generator": "Visual Studio 17 2022",
+      "architecture": "x64",
+      "binaryDir": "${sourceDir}/build/windows-msvc-debug",
+      "cacheVariables": {
+        "CMAKE_CONFIGURATION_TYPES": "Debug;Release;RelWithDebInfo"
+      }
+    }
+  ]
+}
+```
+
+Use `juce_add_plugin()` for plug-ins. Example skeleton:
+
+```cmake
+add_subdirectory(external/JUCE)
+
+juce_add_plugin(MyPlugin
+    COMPANY_NAME "Your Company"
+    PLUGIN_MANUFACTURER_CODE Ycmp
+    PLUGIN_CODE Yplg
+    PRODUCT_NAME "MyPlugin"
+    PLUGIN_NAME "MyPlugin"
+    FORMATS VST3 Standalone
+    IS_SYNTH FALSE
+    NEEDS_MIDI_INPUT FALSE
+    NEEDS_MIDI_OUTPUT FALSE
+    IS_MIDI_EFFECT FALSE
+    COPY_PLUGIN_AFTER_BUILD FALSE
+)
+
+target_sources(MyPlugin PRIVATE
+    src/plugin/PluginProcessor.cpp
+    src/plugin/PluginEditor.cpp
+    src/dsp/DspCore.cpp
+    src/state/StateModel.cpp
+)
+
+target_compile_features(MyPlugin PRIVATE cxx_std_20)
+
+target_link_libraries(MyPlugin PRIVATE
+    juce::juce_audio_utils
+    juce::juce_dsp
+)
+
+juce_generate_juce_header(MyPlugin)
+```
+
+`COPY_PLUGIN_AFTER_BUILD` may be enabled for local developer presets only. CI should package artifacts explicitly.
+
+### 1.5 Warning and analysis policy
+
+Project code must build cleanly at high warning levels. Suppressions must be narrow, justified, and never used to hide real UB, lifetime, conversion, or truncation issues.
+
+Recommended MSVC warnings and definitions:
+
+```cmake
+target_compile_options(MyPlugin PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/W4 /permissive- /Zc:__cplusplus /MP>
+)
+
+target_compile_definitions(MyPlugin PRIVATE
+    JUCE_MODAL_LOOPS_PERMITTED=0
+    JUCE_STRICT_REFCOUNTEDPOINTER=1
+)
+```
+
+Treat `JUCE_MODAL_LOOPS_PERMITTED=0` as a guardrail against UI patterns that can cause re-entrancy surprises. Validate any JUCE-specific definitions against the pinned JUCE version.
+
+---
+
+## 2. Repository and architecture
+
+### 2.1 Recommended directory layout
+
+```text
+.
+├── CMakeLists.txt
+├── CMakePresets.json
+├── cmake/
+├── external/
+│   └── JUCE/                    # pinned release, submodule, or fetched dependency
+├── src/
+│   ├── plugin/                  # JUCE AudioProcessor/AudioProcessorEditor glue
+│   ├── dsp/                     # SDK-independent DSP core
+│   ├── parameters/              # parameter IDs, ranges, smoothing metadata
+│   ├── state/                   # preset/state serialization and migration
+│   ├── ui/                      # components, look-and-feel, assets
+│   └── platform/                # narrow platform wrappers only
+├── tests/
+│   ├── unit/
+│   ├── dsp_regression/
+│   ├── state_migration/
+│   └── realtime_safety/
+├── tools/
+└── docs/
+```
+
+### 2.2 Layering rule
+
+The core DSP must not include JUCE headers except where explicitly justified. A good default is:
+
+- `src/dsp`: standard C++20 only, plus small project utilities.
+- `src/parameters`: standard C++20 data models; JUCE-specific parameter creation lives in plugin glue.
+- `src/plugin`: JUCE `AudioProcessor`, APVTS, bus layouts, host callbacks.
+- `src/ui`: JUCE components and editor code.
+
+This separation allows fast unit tests, alternate SDK wrappers, offline test rendering, and safer agent edits.
+
+### 2.3 Processor responsibilities
+
+`AudioProcessor` owns:
+
+- APVTS or another approved parameter/state model;
+- `prepareToPlay()` allocation and configuration;
+- `processBlock()` adaptation from JUCE buffers to DSP spans;
+- state save/load entry points;
+- latency/tail/bypass reporting;
+- bus layout negotiation;
+- MIDI/event routing where applicable.
+
+`AudioProcessor` must not contain large DSP algorithms inline. It orchestrates the DSP core.
+
+### 2.4 DSP core responsibilities
+
+A DSP module should expose a small interface:
+
+```cpp
+struct PrepareSpec {
+    double sampleRate = 44100.0;
+    int maxBlockSize = 512;
+    int numChannels = 2;
+};
+
+class DspCore final {
+public:
+    void prepare(const PrepareSpec& spec);
+    void reset() noexcept;
+    void setParameters(const ParameterSnapshot& snapshot) noexcept;
+    void process(AudioBlockView block) noexcept;
+};
+```
+
+The DSP core should be deterministic, no-throw after `prepare()`, and directly unit-testable without a plug-in host.
+
+---
+
+## 3. Formatting, naming, and style
+
+### 3.1 Formatting
+
+Use `clang-format` in CI. A compact starting configuration:
+
+```yaml
+BasedOnStyle: LLVM
+IndentWidth: 4
+ColumnLimit: 110
+PointerAlignment: Left
+AllowShortFunctionsOnASingleLine: Empty
+NamespaceIndentation: All
+SortIncludes: CaseSensitive
+```
+
+Agents must format only files they edit unless explicitly asked to reformat the project.
+
+### 3.2 Naming
+
+Use consistent, descriptive names. Recommended defaults:
+
+- Types: `PascalCase` (`DspCore`, `ParameterSnapshot`).
+- Functions and local variables: `camelCase` (`prepareToPlay`, `targetGain`).
+- Constants: `kPascalCase` or `PascalCase`; choose one project-wide.
+- Member variables: `member_` or `mMember`; choose one project-wide.
+- Namespaces: short, stable, lowercase or PascalCase, but consistent.
+
+Allow established DSP/audio abbreviations: `fft`, `ifft`, `rms`, `iir`, `fir`, `lfo`, `dc`, `midi`, `ui`, `simd`, `dB`, `lufs`.
+
+### 3.3 Headers and includes
+
+- Use `#pragma once` in headers.
+- Do not put `#pragma once` in `.cpp` files.
+- Include the matching header first in `.cpp` files.
+- Prefer forward declarations in headers when they reduce dependency weight.
+- Keep JUCE includes out of DSP headers unless unavoidable.
+
+### 3.4 Comments
+
+Comments should explain invariants, timing constraints, ownership, and algorithm choices. Avoid stale file banners with author/date fields.
+
+Good comments:
+
+```cpp
+// Audio-thread only. Reads atomics and preallocated buffers only.
+void processBlock(juce::AudioBuffer<float>&, juce::MidiBuffer&) noexcept;
+
+// We use a TPT one-pole smoother so coefficient changes remain stable at high cutoff values.
+```
+
+Bad comments:
+
+```cpp
+sample++; // increment sample
+```
+
+---
+
+## 4. JUCE lifecycle rules
+
+### 4.1 Constructor
+
+Allowed:
+
+- Define static parameter layout.
+- Construct APVTS.
+- Initialise small value types.
+- Register immutable metadata.
+
+Avoid:
+
+- Heavy allocation.
+- Host-dependent work.
+- File I/O.
+- Assumptions about sample rate, block size, channel count, or active bus layout.
+
+### 4.2 `prepareToPlay(double sampleRate, int samplesPerBlock)`
+
+This is the primary place to allocate sample-rate/block-size-dependent resources.
+
+Required:
+
+- Validate `sampleRate > 0` and `samplesPerBlock >= 0`.
+- Prepare all DSP modules.
+- Preallocate temporary buffers for the maximum block size expected.
+- Prepare oversamplers, delay lines, filters, smoothers, FFT plans, and SIMD buffers.
+- Reset denormal-prone state.
+- Compute/report latency when it changes.
+
+Do not assume the host will keep the same block size forever. `samplesPerBlock` is a hint/maximum in many contexts. `processBlock()` must tolerate smaller, larger, and zero-length buffers. If a block exceeds the prepared maximum, use a pre-agreed safe path: split processing into chunks, resize only outside the audio thread if the host allows, or bypass safely and flag a diagnostic.
+
+### 4.3 `processBlock()`
+
+Required at the top of every floating-point `processBlock()` implementation:
+
+```cpp
+void MyProcessor::processBlock(juce::AudioBuffer<float>& buffer,
+                               juce::MidiBuffer& midiMessages)
+{
+    juce::ScopedNoDenormals noDenormals;
+
+    // No allocation, no locks, no waits, no logging, no GUI calls, no exceptions.
+    // ...
+}
+```
+
+Rules:
+
+- Do not allocate or free memory.
+- Do not call `MessageManagerLock`, `callAsync` patterns that may allocate, modal UI, file/network APIs, logging APIs, or OS APIs with unknown latency.
+- Do not mutate APVTS `ValueTree` state.
+- Do not call `copyState()` or `replaceState()`.
+- Do not construct or destroy objects whose constructors/destructors allocate, lock, log, or notify.
+- Do not use `shared_ptr` ownership churn.
+- Do not access UI components.
+- Do not assume channel count or block size is constant.
+- Handle bypass, silence, zero samples, and more output channels than input channels.
+
+A minimal channel-safe pattern:
+
+```cpp
+void MyProcessor::processBlock(juce::AudioBuffer<float>& buffer,
+                               juce::MidiBuffer& midi)
+{
+    juce::ScopedNoDenormals noDenormals;
+
+    const int numSamples = buffer.getNumSamples();
+    const int numChannels = buffer.getNumChannels();
+
+    if (numSamples == 0)
+        return;
+
+    updateAudioThreadParameters(numSamples); // atomics/smoothing only
+
+    for (int ch = 0; ch < numChannels; ++ch) {
+        auto* channel = buffer.getWritePointer(ch);
+        dspCore_.processChannel(ch, std::span<float>{channel, static_cast<size_t>(numSamples)});
+    }
+}
+```
+
+### 4.4 `releaseResources()`
+
+Allowed:
+
+- Release large buffers if the processor is no longer active.
+- Reset prepared flags.
+
+Do not assume `releaseResources()` is the only teardown path. Destructors must still be safe.
+
+### 4.5 State methods
+
+`getStateInformation()` and `setStateInformation()` are not audio callbacks. They may lock or allocate if necessary, but must be robust against host threading and malformed data.
+
+Rules:
+
+- Use versioned state.
+- Validate all input data.
+- Never trust preset files.
+- Never deserialize raw pointers or platform-dependent layouts.
+- Preserve backwards compatibility.
+- Do not call audio-thread-only methods.
+- Use APVTS `copyState()`/`replaceState()` outside audio only; they are thread-safe but not real-time-safe.
+
+---
+
+## 5. Parameters and automation in JUCE
+
+### 5.1 Parameter layout
+
+Use the modern APVTS constructor with `ParameterLayout`. Do not use deprecated `createAndAddParameter()` patterns.
+
+```cpp
+juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout()
+{
+    std::vector<std::unique_ptr<juce::RangedAudioParameter>> params;
+
+    params.push_back(std::make_unique<juce::AudioParameterFloat>(
+        juce::ParameterID{"gain", 1},
+        "Gain",
+        juce::NormalisableRange<float>{-60.0f, 12.0f, 0.01f},
+        0.0f,
+        juce::AudioParameterFloatAttributes{}.withLabel("dB")));
+
+    return {params.begin(), params.end()};
+}
+```
+
+Parameter IDs are permanent. Names shown to users may change; IDs should not.
+
+### 5.2 Raw parameter access
+
+For simple scalar parameters, cache the atomic pointer returned by `getRawParameterValue()` during construction or preparation, then read it from the audio thread.
+
+```cpp
+std::atomic<float>* gainParam_ = nullptr;
+
+gainParam_ = apvts_.getRawParameterValue("gain");
+
+const float gainDb = gainParam_->load(std::memory_order_relaxed);
+```
+
+Use `memory_order_relaxed` for independent scalar parameter values. Use acquire/release only when a scalar flag publishes other related data.
+
+### 5.3 Smoothing
+
+Never apply abrupt continuous parameter changes directly to audio unless the parameter is explicitly designed to be stepped.
+
+Use one of:
+
+- `juce::SmoothedValue<float>` for simple linear or multiplicative smoothing;
+- custom TPT/state-variable smoothing for filter coefficients;
+- sample-accurate ramp processing for parameters that require exact host automation behaviour;
+- block-to-block smoothing for low-rate controls where acceptable.
+
+Example:
+
+```cpp
+void prepareToPlay(double sampleRate, int samplesPerBlock) override
+{
+    gainSmoothed_.reset(sampleRate, 0.02); // 20 ms
+    gainSmoothed_.setCurrentAndTargetValue(1.0f);
+}
+
+void updateAudioThreadParameters(int numSamples) noexcept
+{
+    const float gainDb = gainParam_->load(std::memory_order_relaxed);
+    gainSmoothed_.setTargetValue(juce::Decibels::decibelsToGain(gainDb));
+}
+```
+
+Discrete parameters, algorithm selectors, quality modes, and oversampling changes must not reallocate or rebuild DSP objects in the audio thread. Use safe pending-change mechanisms and apply them at non-real-time lifecycle points or via immutable prepared snapshots.
+
+### 5.4 Attachments and UI
+
+Use APVTS attachments for standard controls. Attachment lifetimes must be shorter than both the control and APVTS. Prefer member declaration order that destroys attachments before controls if needed.
+
+UI controls must not directly write DSP state. They write parameters; the processor consumes parameter values safely.
+
+---
+
+## 6. Dedicated thread-safety and memory-safety standard
+
+### 6.1 Thread roles
+
+Assume the following threads may exist:
+
+- **Audio thread:** calls `processBlock()`. Hard real-time constraints.
+- **Message/UI thread:** constructs and updates editor components.
+- **Host worker threads:** may call state, parameter, scanning, layout, and lifecycle methods.
+- **Background worker threads:** project-owned analysis, preset scanning, file loading, licensing, ML/model preparation, etc.
+
+Do not assume only “UI thread” and “audio thread.” Hosts vary.
+
+### 6.2 Audio-thread forbidden operations
+
+The audio thread must not:
+
+- allocate or deallocate heap memory;
+- grow `std::vector`, `std::string`, `juce::Array`, `juce::String`, `std::function`, or any container;
+- lock or unlock mutexes;
+- call `std::atomic::wait`, condition variables, semaphores, futures, joins, sleeps, or yields;
+- perform file, console, network, registry, Objective-C, COM, Win32, CoreFoundation, or OS calls with unknown latency;
+- log;
+- interact with UI components;
+- call `MessageManagerLock`;
+- throw exceptions or allow exceptions to escape;
+- create/destroy objects with non-trivial destructors that may allocate, lock, notify, or deallocate;
+- perform unbounded loops dependent on user files, presets, or host state.
+
+### 6.3 Atomics
+
+Use atomics for simple scalars and flags.
+
+```cpp
+std::atomic<float> targetCutoffHz {1000.0f};
+
+// UI/host/non-RT thread
+targetCutoffHz.store(newValue, std::memory_order_relaxed);
+
+// audio thread
+const float cutoff = targetCutoffHz.load(std::memory_order_relaxed);
+```
+
+Memory order policy:
+
+- `relaxed`: independent scalar parameters, counters, meters where exact cross-variable ordering is unnecessary.
+- `release`/`acquire`: publish an immutable snapshot pointer or a group of related data.
+- `seq_cst`: only when a clear correctness argument requires global ordering.
+
+Check lock freedom for hot atomics if using unusual types:
+
+```cpp
+static_assert(std::atomic<float>::is_always_lock_free,
+              "Audio-thread float atomics must be lock-free on this target");
+```
+
+If the assertion fails on a supported target, redesign the communication path.
+
+### 6.4 Immutable snapshot handoff
+
+For complex state, prefer immutable snapshots prepared off the audio thread.
+
+Pattern:
+
+1. Build new state on a background or message thread.
+2. Validate and fully allocate it.
+3. Publish a pointer/index atomically.
+4. Audio thread observes the new snapshot and switches at a safe boundary.
+5. Retire old snapshots only after the audio thread can no longer access them.
+
+Avoid deleting the previous snapshot on the audio thread. Use generation counters, deferred reclamation, or a small preallocated pool.
+
+### 6.5 Lock-free queues
+
+Use SPSC queues for one producer and one consumer only. Do not use an SPSC queue for multiple UI/background producers.
+
+Queue payloads must be:
+
+- trivially copyable or guaranteed non-allocating to copy/move;
+- small enough for bounded throughput;
+- free of owning pointers unless lifetime is externally guaranteed;
+- versioned if interpretation can change.
+
+Production queues must use cache-line padding to avoid false sharing:
+
+```cpp
+struct alignas(64) AtomicIndex {
+    std::atomic<size_t> value {0};
+};
+```
+
+Never block waiting for queue space on the audio thread. If the queue is full, drop, coalesce, or set an overflow flag according to the documented policy.
+
+### 6.6 ABA and reclamation
+
+ABA hazards occur when a pointer/index changes A→B→A and a consumer mistakes the final A for the original A. Avoid ABA by:
+
+- using generation counters with indices;
+- avoiding raw pointer compare-exchange for reclaimable objects;
+- using immutable buffers with deferred reclamation;
+- using small object pools where objects are not reused until a safe epoch;
+- keeping audio-thread communication SPSC where possible.
+
+### 6.7 False sharing
+
+Frequently written atomics used by different threads must not share cache lines. Pad or separate:
+
+- queue read/write indices;
+- meters written by audio and read by UI;
+- flags updated at high frequency;
+- per-channel DSP state processed by worker threads.
+
+### 6.8 Ownership and lifetime
+
+Rules:
+
+- Use `std::unique_ptr` for unique ownership outside hot loops.
+- Use raw pointers or references as non-owning views only when lifetime is obvious and documented.
+- Avoid `std::shared_ptr` and `std::weak_ptr` on the audio path. Reference count increments/decrements are atomic operations and final release may delete on the wrong thread.
+- Do not capture `this` in async callbacks unless cancellation/lifetime is guaranteed.
+- Editors must tolerate processor destruction ordering and host editor recreation.
+- Use `juce::Component::SafePointer` for UI callbacks targeting components, not for audio-thread communication.
+
+### 6.9 Memory allocation policy
+
+- Allocate in constructors only for host-independent small objects.
+- Allocate sample-rate/block-size resources in `prepareToPlay()`.
+- Reserve vectors to maximum capacity before audio use.
+- Never call `shrink_to_fit()` in real-time paths.
+- Prefer `std::array` for fixed-size state.
+- Use aligned buffers for SIMD.
+- Use custom arenas only when they are preallocated and their allocation/deallocation operations are bounded and non-blocking.
+- `std::pmr` is not automatically real-time-safe; it is only safe if backed by a suitable preallocated resource and never exhausted on the audio thread.
+
+### 6.10 Sanitizers and static analysis
+
+Required CI jobs where practical:
+
+- MSVC `/analyze` or C++ Core Guidelines checker.
+- MSVC AddressSanitizer on Windows for tests and standalone harnesses.
+- Clang AddressSanitizer and UndefinedBehaviorSanitizer on at least one platform.
+- Clang ThreadSanitizer on non-real-time test harnesses for cross-thread code.
+- `clang-tidy` for modernize, bugprone, performance, readability, and concurrency-relevant checks.
+
+Sanitizers are not a substitute for design. They detect classes of bugs under tested executions; they do not prove real-time safety.
+
+---
+
+## 7. DSP engineering standards
+
+### 7.1 Denormals/subnormals
+
+Every floating-point processing block must prevent denormal slowdowns.
+
+JUCE default:
+
+```cpp
+juce::ScopedNoDenormals noDenormals;
+```
+
+Additionally:
+
+- Reset feedback/filter states when they become non-finite or subnormal-prone.
+- Use tiny DC/noise injection only when musically and technically justified.
+- Prefer explicit state sanitization for feedback paths.
+
+### 7.2 Numerical safety
+
+DSP code must defend against:
+
+- NaN and Inf propagation;
+- division by zero;
+- invalid square roots/logarithms;
+- unstable filter coefficients;
+- feedback greater than stable bounds;
+- extreme sample rates;
+- host-provided bad or unusual parameter values;
+- denormal states after long silence.
+
+Use targeted guards:
+
+```cpp
+inline float sanitizeSample(float x) noexcept
+{
+    return std::isfinite(x) ? x : 0.0f;
+}
+```
+
+Do not scatter expensive checks in every sample of a hot loop unless necessary. Prefer per-block validation, coefficient validation, and debug-only assertions where sufficient.
+
+### 7.3 Parameter smoothing and coefficient updates
+
+- Smooth audible continuous parameters.
+- Recalculate coefficients at a controlled rate.
+- Interpolate safely where filters can tolerate interpolation.
+- For filters, prefer topologies stable under modulation, such as TPT/SVF designs, for fast-changing cutoff/resonance.
+- Do not apply discontinuous algorithm changes in the middle of a block unless crossfaded.
+
+### 7.4 Oversampling and anti-aliasing
+
+Use oversampling for nonlinear processing when aliasing would be audible or measurable.
+
+With `juce::dsp::Oversampling`:
+
+- Prepare during `prepareToPlay()`.
+- Choose FIR vs IIR stages based on phase/latency trade-off.
+- Report latency via `setLatencySamples()` when oversampling latency changes.
+- Test aliasing at multiple sample rates and drive levels.
+- Avoid changing oversampling factor in the audio thread; prepare separate chains or apply changes when inactive.
+
+### 7.5 Latency and tail
+
+If processing introduces latency, report it accurately:
+
+```cpp
+setLatencySamples(computedLatencySamples);
+```
+
+Rules:
+
+- Update latency only at safe lifecycle/configuration points.
+- Test reported latency with impulse tests.
+- Implement tail reporting where relevant.
+- Clear or preserve tails intentionally on bypass, reset, and transport changes.
+
+### 7.6 Bypass
+
+Bypass behaviour must be defined:
+
+- hard bypass;
+- smoothed/crossfaded bypass;
+- latency-compensated bypass;
+- tail-preserving bypass;
+- host bypass parameter handling.
+
+Avoid clicks on bypass transitions. If the plug-in has latency, bypass must not create timing discontinuities.
+
+### 7.7 SIMD
+
+SIMD is encouraged only when guarded by correctness tests and profiling.
+
+Options:
+
+- `juce::FloatVectorOperations` for common vector operations.
+- `juce::dsp::SIMDRegister` for portable SIMD-friendly code.
+- Platform intrinsics only behind narrow abstraction layers.
+
+Rules:
+
+- Ensure alignment where required.
+- Provide scalar fallback.
+- Test tail handling for non-multiple vector lengths.
+- Compare output against scalar reference within defined tolerances.
+
+### 7.8 CPU budget
+
+For a block of `N` samples at sample rate `Fs`, the callback period is `N / Fs` seconds. A 64-sample buffer at 48 kHz gives about 1.33 ms total wall-clock time, and the plug-in only gets a fraction of that.
+
+Standards:
+
+- Profile Release builds, not Debug.
+- Profile in real hosts and offline harnesses.
+- Track worst-case, not only average CPU.
+- Avoid first-use costs in the first audio block.
+- Warm up lookup tables, FFT plans, oversamplers, and model state outside the audio thread.
+
+
+### 7.9 Advanced DSP research and implementation checklist
+
+Use this section when designing new effects or instruments. It is intentionally broader than a narrow coding-style guide because many plug-in bugs are algorithm-design bugs expressed as code.
+
+#### 7.9.1 Nonlinear and virtual-analog processing
+
+Nonlinear processors include saturation, clipping, waveshaping, compressors with nonlinear detectors, filters with nonlinear feedback, virtual analog circuits, exciters, tape models, and amp/cabinet models.
+
+Standards:
+
+- Expect aliasing. Test it rather than assuming oversampling is enough.
+- Consider oversampling, antiderivative anti-aliasing, band-limited nonlinear design, or model-specific anti-aliasing depending on the algorithm.
+- Drive-dependent latency and quality modes must be documented.
+- Crossfade when switching quality/oversampling modes.
+- Validate at 44.1, 48, 96, and 192 kHz where supported.
+- Test high-frequency sine sweeps and high-drive impulses for foldback.
+- Clamp internal feedback and state variables to stable physical/algorithmic limits.
+
+#### 7.9.2 Filters and time-varying systems
+
+Filters used in musical plug-ins are often modulated. A filter that is stable for static coefficients can click, zipper, or become unstable under modulation.
+
+Standards:
+
+- Prefer modulation-friendly topologies for rapidly changing cutoff/resonance.
+- Smooth parameter values or coefficients, but do not interpolate coefficients blindly for unstable structures.
+- Validate behaviour near Nyquist, near zero frequency, at high resonance, and under fast automation.
+- Use double precision for coefficient calculation when it improves stability, even if audio samples are float.
+- Document filter topology and known trade-offs.
+
+#### 7.9.3 Dynamics processing
+
+Dynamics processors must define their detector, ballistics, gain computer, and smoothing precisely.
+
+Standards:
+
+- Document peak/RMS/LUFS-like detector choices.
+- Define attack/release curves, knee shape, lookahead latency, sidechain filtering, and stereo linking.
+- Test gain reduction with impulses, stepped tones, sine bursts, and silence recovery.
+- Avoid denormal-prone envelope tails.
+- Report lookahead latency and preserve timing under bypass.
+
+#### 7.9.4 Delay, reverb, and feedback networks
+
+Feedback systems require explicit stability policy.
+
+Standards:
+
+- Bound feedback coefficients.
+- Clear or fade feedback buffers on reset and sample-rate changes.
+- Smooth delay-time changes using interpolation or crossfading.
+- For fractional delays, test interpolation error and modulation artifacts.
+- For reverbs, test tail length, denormal behaviour, silence detection, and bypass transitions.
+
+#### 7.9.5 Convolution and impulse responses
+
+Convolution processors are high risk for real-time allocation and latency mistakes.
+
+Standards:
+
+- Load and parse impulse responses off the audio thread.
+- Build FFT plans and partitions off the audio thread.
+- Publish new convolution engines using immutable snapshot handoff.
+- Crossfade IR changes.
+- Report partitioning latency accurately.
+- Test malformed, huge, zero-length, mono, stereo, and mismatched sample-rate IRs.
+
+#### 7.9.6 Spectral and time-frequency processing
+
+STFT/phase-vocoder/spectral processors must treat windowing, hop size, phase, and latency as part of the product design.
+
+Standards:
+
+- Preallocate all FFT buffers and plans.
+- Document window type, overlap, hop size, latency, and reconstruction assumptions.
+- Test overlap-add reconstruction error.
+- Handle transport jumps and reset state clearly.
+- Avoid allocating when the FFT size changes; prepare configurations in advance or change only while inactive.
+
+#### 7.9.7 Resampling
+
+Resampling appears in oversampling, sample playback, IR loading, granular processing, and pitch/time effects.
+
+Standards:
+
+- Use well-characterised polyphase or band-limited resamplers for quality-critical paths.
+- Define passband, stopband, phase, latency, and CPU targets.
+- Test with sweeps and impulses.
+- Do not instantiate or resize resamplers in the audio callback.
+
+#### 7.9.8 Instruments, voices, and MIDI
+
+Instrument plug-ins must preallocate voices and event storage.
+
+Standards:
+
+- No per-note heap allocation.
+- Deterministic voice stealing.
+- Sample-accurate event handling where the format/host provides offsets.
+- Bounded modulation matrix work per block.
+- Clear sustain/sostenuto/all-notes-off/all-sound-off behaviour.
+- Avoid dynamic graph rebuilding on note-on.
+
+#### 7.9.9 Spatial, surround, and immersive processing
+
+For spatial plug-ins, channel semantics are part of correctness.
+
+Standards:
+
+- Define supported layouts explicitly.
+- Keep channel order conversions isolated and tested.
+- Test mono, stereo, surround, ambisonic, and sidechain cases as applicable.
+- Validate downmix/upmix behaviour.
+- For HRTF or convolution spatializers, use the convolution safety rules above.
+
+#### 7.9.10 ML/model-based DSP
+
+Machine-learning or model-inference DSP is permitted only with strict real-time controls.
+
+Standards:
+
+- No Python, interpreter, JIT compilation, graph optimisation, file loading, or dynamic allocation in the audio callback.
+- Warm up inference engines before audio starts.
+- Preallocate tensors and scratch buffers.
+- Provide deterministic CPU fallback if GPU/accelerator use is not host-safe.
+- Bound model execution time and test worst-case CPU.
+- Validate model files as untrusted input.
+- Provide bypass/fallback if model preparation fails.
+
+#### 7.9.11 Determinism and reproducibility
+
+Bit-identical output across platforms is often unrealistic for floating-point DSP, especially with SIMD and different math libraries. The standard is controlled, tested tolerance, not false precision.
+
+- Define acceptable numerical tolerances per algorithm.
+- Use deterministic random seeds where needed.
+- Avoid unspecified iteration order in DSP-affecting code.
+- Document any platform-specific approximations.
+- Use golden tests with tolerance and spectral criteria.
+
+
+---
+
+## 8. State, presets, and migration
+
+### 8.1 State model
+
+State must be versioned:
+
+```cpp
+struct StateHeader {
+    uint32_t magic = 0x4D59504C; // MYPL
+    uint32_t version = 1;
+};
+```
+
+For APVTS XML/ValueTree state, include a version property.
+
+Rules:
+
+- Never serialize raw pointers.
+- Validate all values on load.
+- Clamp to safe ranges.
+- Preserve unknown future fields where practical.
+- Add migration tests for every state version.
+
+### 8.2 Parameter compatibility
+
+Do not change without explicit migration:
+
+- parameter ID;
+- normalization mapping;
+- default value;
+- discrete step count;
+- automatable flag;
+- unit semantics.
+
+When a parameter must be removed, keep a hidden/deprecated compatibility parameter if host automation or session recall depends on it.
+
+### 8.3 Preset loading
+
+Preset loading may allocate and parse, but not on the audio thread. If loading requires new DSP resources, prepare them off-thread and publish an immutable snapshot safely.
+
+Malformed presets must not crash the plug-in.
+
+---
+
+## 9. UI standards
+
+### 9.1 Separation
+
+The editor must not own DSP state. It observes processor state and writes parameters through APVTS attachments or safe parameter APIs.
+
+### 9.2 Message thread only
+
+JUCE components are message-thread objects. Do not access them from `processBlock()`.
+
+Meters and visualizers should use one-way communication:
+
+- audio thread writes atomics or SPSC queue entries;
+- UI polls on a timer;
+- UI drops frames if it cannot keep up.
+
+### 9.3 Attachments
+
+Attachment lifetimes must be explicit. A common pattern:
+
+```cpp
+class MyEditor final : public juce::AudioProcessorEditor {
+    juce::Slider gainSlider_;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> gainAttachment_;
+};
+```
+
+Construct controls before attachments. Destroy attachments before controls if declaration order requires it.
+
+### 9.4 Assets
+
+- Load fonts/images once, outside audio.
+- Avoid blocking disk I/O when opening the editor; embed critical assets or preload asynchronously.
+- Validate image scaling and HiDPI behaviour.
+- Avoid unbounded repaint rates.
+
+---
+
+## 10. Error handling and diagnostics
+
+### 10.1 Exceptions
+
+Project policy:
+
+- No exceptions from `processBlock()` or DSP hot paths.
+- No exceptions across JUCE/host callbacks.
+- No exceptions from destructors.
+- Catch at boundaries where third-party code may throw, then convert to safe state and diagnostics.
+
+### 10.2 Assertions
+
+Use assertions for invariants, not runtime error handling.
+
+```cpp
+jassert(sampleRate > 0.0);
+```
+
+Release builds must remain safe if assertions are disabled.
+
+### 10.3 Logging
+
+Logging is forbidden on the audio thread. Non-real-time logging must be bounded and optionally compiled out of release builds. For audio-thread diagnostics, write atomics/counters and read them from a non-real-time context.
+
+---
+
+## 11. Testing requirements
+
+### 11.1 Unit tests
+
+DSP modules must have unit tests independent of JUCE host wrappers.
+
+Test:
+
+- parameter ranges;
+- gain and unity cases;
+- silence;
+- impulse response;
+- denormal-prone silence tails;
+- NaN/Inf inputs;
+- sample-rate changes;
+- zero-length blocks;
+- maximum block sizes;
+- mono/stereo/multichannel layouts;
+- bypass transitions.
+
+### 11.2 Golden and spectral tests
+
+Use golden-output tests for stable algorithms. Use spectral/aliasing tests for nonlinear processors. Define tolerances explicitly; do not require bit identity unless the algorithm is designed for it.
+
+### 11.3 State migration tests
+
+Every supported state version must have fixtures. Tests must load old presets and verify parameter values, hidden compatibility fields, and output behaviour.
+
+### 11.4 Real-time safety tests
+
+At minimum:
+
+- allocation counter around DSP process calls in a standalone harness;
+- lock-detection wrappers for project mutexes;
+- stress tests with random block sizes;
+- test first audio block after `prepareToPlay()`;
+- repeated prepare/release cycles.
+
+### 11.5 VST3 validation
+
+Even JUCE-built VST3 plug-ins should be run through Steinberg's VST3 validator in CI where practical. Add smoke tests in representative DAWs before release.
+
+### 11.6 Sanitizer tests
+
+Run sanitizer tests on standalone/unit harnesses, not necessarily inside every DAW. Use:
+
+- ASAN for use-after-free, buffer overflows, and allocation bugs;
+- UBSAN for undefined behaviour;
+- TSAN for data races in non-real-time harnesses;
+- MSVC ASAN on Windows where supported.
+
+---
+
+## 12. CI and release gates
+
+A production CI pipeline should include:
+
+1. Configure with CMake presets.
+2. Build Debug and Release/RelWithDebInfo.
+3. Run unit tests.
+4. Run DSP regression tests.
+5. Run state migration tests.
+6. Run static analysis / clang-tidy.
+7. Run sanitizer jobs.
+8. Build VST3 artifact.
+9. Run VST3 validator.
+10. Package artifact.
+11. Optional: smoke-test in a plugin host.
+12. Sign/notarize where applicable.
+
+Release builds must be reproducible enough to debug: preserve symbols, record dependency versions, compiler versions, CMake presets, and Git commit.
+
+---
+
+## 13. Agentic coder rules
+
+When an agent modifies a JUCE plug-in project, it must follow these rules:
+
+1. **Never edit parameter IDs casually.** If a change touches parameter IDs, ranges, defaults, or state migration, flag it explicitly.
+2. **Never add audio-thread allocations.** Avoid containers, strings, function wrappers, `shared_ptr`, logging, locks, and UI calls in `processBlock()` or DSP calls.
+3. **Preserve lifecycle boundaries.** Allocate in `prepareToPlay()`, not in `processBlock()`.
+4. **Keep DSP testable.** New algorithms go into `src/dsp` with tests.
+5. **Use atomics correctly.** Use relaxed loads for independent scalars; do not use `atomic::wait` on the audio thread.
+6. **Prefer simple loops in hot paths.** Do not introduce ranges, virtual dispatch, heap-owning abstractions, or callbacks into sample loops without profiling.
+7. **Add or update tests.** DSP changes require DSP tests. State changes require migration tests. Thread communication changes require stress/sanitizer tests.
+8. **Report uncertainty.** If a host or SDK callback thread is unclear, assume the stricter real-time/thread-safety requirement until verified.
+9. **Do not make broad formatting diffs.** Format touched files only unless requested.
+10. **Run the documented build/test commands before claiming completion.**
+
+---
+
+## 14. Code review checklist
+
+### Real-time safety
+
+- [ ] No allocation/deallocation in `processBlock()` or DSP hot path.
+- [ ] No locks, waits, sleeps, logging, file/network I/O, or GUI calls in audio code.
+- [ ] No `shared_ptr` ownership churn in audio code.
+- [ ] No exceptions escape callbacks.
+- [ ] Denormal protection present.
+- [ ] Variable and zero block sizes handled.
+
+### Thread and memory safety
+
+- [ ] Cross-thread data uses atomics, immutable snapshots, or bounded queues.
+- [ ] Atomic memory orders are justified.
+- [ ] Queue use matches producer/consumer assumptions.
+- [ ] Object lifetimes are clear.
+- [ ] No false-sharing hotspots in high-frequency atomics.
+- [ ] Sanitizer/static-analysis coverage exists for new patterns.
+
+### DSP correctness
+
+- [ ] Parameter smoothing is appropriate.
+- [ ] NaN/Inf/denormal behaviour is handled.
+- [ ] Latency and tail are reported correctly.
+- [ ] Oversampling/anti-aliasing choices are tested.
+- [ ] SIMD has scalar fallback and tolerance tests.
+
+### JUCE integration
+
+- [ ] APVTS uses modern `ParameterLayout`.
+- [ ] APVTS `copyState()`/`replaceState()` not used on audio thread.
+- [ ] Attachments have safe lifetimes.
+- [ ] UI does not access DSP mutable state directly.
+- [ ] Bus layouts and channel counts are handled.
+
+### Build and release
+
+- [ ] CMake minimum satisfies current JUCE requirement.
+- [ ] Warnings clean.
+- [ ] Tests pass.
+- [ ] VST3 validator passes.
+- [ ] Dependency versions recorded.
+
+---
+
+## 15. References
+
+- JUCE CMake API: https://github.com/juce-framework/JUCE/blob/master/docs/CMake%20API.md
+- JUCE releases: https://github.com/juce-framework/JUCE/releases
+- JUCE `AudioProcessorValueTreeState`: https://docs.juce.com/master/classjuce_1_1AudioProcessorValueTreeState.html
+- JUCE APVTS tutorial: https://juce.com/tutorials/tutorial_audio_processor_value_tree_state/
+- JUCE `dsp::Oversampling`: https://docs.juce.com/master/classdsp_1_1Oversampling.html
+- Steinberg VST3 API documentation: https://steinbergmedia.github.io/vst3_dev_portal/pages/Technical%2BDocumentation/API%2BDocumentation/Index.html
+- Steinberg VST3 validator: https://steinbergmedia.github.io/vst3_dev_portal/pages/What%2Bis%2Bthe%2BVST%2B3%2BSDK/Validator.html
+- C++ Core Guidelines: https://isocpp.github.io/CppCoreGuidelines/CppCoreGuidelines
+- Microsoft C++ Core Guidelines checker: https://learn.microsoft.com/cpp/code-quality/using-the-cpp-core-guidelines-checkers
+- Microsoft `/fsanitize`: https://learn.microsoft.com/cpp/build/reference/fsanitize
+- Clang ThreadSanitizer: https://clang.llvm.org/docs/ThreadSanitizer.html
+- Clang UndefinedBehaviorSanitizer: https://clang.llvm.org/docs/UndefinedBehaviorSanitizer.html
+- PortAudio callback documentation: https://files.portaudio.com/docs/v19-doxydocs-dev/portaudio_8h.html
+- Ross Bencina, “Real-time audio programming 101”: https://www.rossbencina.com/code/real-time-audio-programming-101-time-waits-for-nothing
+- DAFX: Digital Audio Effects, Second Edition: https://www.dafx.de/DAFX_Book_Page_2nd_edition/index.html
+
