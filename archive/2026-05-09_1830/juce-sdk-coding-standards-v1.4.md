@@ -1,6 +1,6 @@
 # Modern Professional Coding Standards for JUCE-Based VST3 Plug-ins
 
-**Version:** 1.3  
+**Version:** 1.4  
 **Generated:** 9 May 2026  
 **Audience:** human developers and agentic coding systems  
 **Scope:** reusable standards for professional JUCE-based audio plug-ins, with VST3 as a required target format
@@ -84,7 +84,7 @@ project(MyPlugin VERSION 1.0.0 LANGUAGES CXX)
 
 Older CMake versions may be suitable for legacy non-JUCE tooling or projects using older preset schemas, but they are not the baseline for this standard.
 
-The upper version in `cmake_minimum_required(VERSION 3.25...3.30)` is an example of a verified compatibility ceiling, not a permanent maximum. Product templates SHOULD set the upper bound to the newest CMake version validated in CI and record the checked date.
+The second version in `cmake_minimum_required(VERSION 3.25...3.30)` is the CMake policy-version maximum, not a cap on which CMake executable may run the project. Product templates SHOULD set that policy maximum to the newest CMake version validated in CI and record the checked date. If a newer CMake executable configures the project, policies introduced after the policy maximum remain at their documented default behaviour until the template is deliberately updated.
 
 ### 2.4 Build system standards
 
@@ -395,6 +395,9 @@ void MyProcessor::processBlock(juce::AudioBuffer<float>& buffer,
     juce::ScopedNoDenormals noDenormals;
 
     const int numSamples = buffer.getNumSamples();
+    handleMidiInput(midi);       // MIDI/control events may be present even for zero-sample blocks.
+    applyMidiOutputPolicy(midi); // non-allocating clear/pass-through/output policy; see §5.8.
+
     if (numSamples == 0)
         return;
 
@@ -406,8 +409,6 @@ void MyProcessor::processBlock(juce::AudioBuffer<float>& buffer,
         buffer.clear(ch, 0, numSamples);
 
     updateAudioThreadParameters(numSamples); // atomics/smoothing only
-
-    handleMidi(midi); // see §5.8 for MIDI iteration rules
 
     AudioBlockView view {
         buffer.getArrayOfWritePointers(),
@@ -498,8 +499,8 @@ Reading the host's playhead is allowed on the audio thread, but the API is falli
 Rules:
 
 - Call `getPlayHead()` once per `processBlock` call; the returned pointer may be `nullptr` (offline render, certain hosts).
-- Use the modern `getPosition()` API, which returns `std::optional<PositionInfo>`. The deprecated `CurrentPositionInfo` struct MUST NOT be used in new code.
-- Treat every field as optional. `getBpm`, `getTimeSignature`, `getPpqPosition`, `getTimeInSamples`, and friends each return `std::optional<...>`. Provide safe fallbacks rather than asserting presence.
+- Use the modern `getPosition()` API, which returns `juce::Optional<PositionInfo>`. The deprecated `CurrentPositionInfo` struct MUST NOT be used in new code.
+- Treat every field as optional. `getBpm`, `getTimeSignature`, `getPpqPosition`, `getTimeInSamples`, and friends each return `juce::Optional<...>`. Provide safe fallbacks rather than asserting presence.
 - Detect transport jumps and looping: a non-monotonic change in `getTimeInSamples` or `getPpqPosition` between blocks indicates a seek/loop and any time-dependent DSP state (LFO phase, tempo-synced delay reads, granular schedulers) MUST be reset or smoothly bridged.
 - Do not retain pointers or references to `PositionInfo` or any sub-object beyond the current block; copy out the values you need.
 - Do not block, allocate, or call back into the host while reading the playhead.
@@ -538,7 +539,10 @@ Rules:
 
 - Iterate `juce::MidiBuffer` with the modern range-for syntax. The legacy `juce::MidiBuffer::Iterator` is deprecated and MUST NOT be used in new code.
 - `juce::MidiMessageMetadata::samplePosition` is the sample-accurate offset within the current block. Honour it for instruments and for any effect whose response should be sample-accurate.
+- A host may deliver MIDI/control events in a zero-sample audio block. MIDI handling MUST happen before any `numSamples == 0` audio-processing early return so note-off, all-notes-off, all-sound-off, transport-related, and controller events are not dropped.
+- Treat the `juce::MidiBuffer` argument as input on entry and MIDI output on return. Every plug-in MUST define whether it passes MIDI through, filters it, transforms it, generates new MIDI, or consumes it. Effects that do not intentionally emit MIDI SHOULD clear the buffer after reading it. Instruments usually consume input MIDI and return an empty buffer unless MIDI output is a product feature.
 - Do not copy events into containers that may allocate. If event reordering or filtering is needed, use a preallocated, fixed-capacity buffer.
+- Avoid `juce::MidiMessageMetadata::getMessage()` on the audio thread for unbounded or variable-length messages. It constructs an owning `juce::MidiMessage` and can allocate for SysEx-sized data. Decode fixed-length channel messages directly from `data`, `numBytes`, and `samplePosition`, or use a project-owned no-allocation parser with a documented SysEx/MIDI 2.0 policy.
 - Do not call `MidiBuffer::addEvent` while iterating the same buffer; collect output into a separate preallocated buffer and swap or merge after iteration.
 - Bound per-block MIDI work. Hosts can deliver dense bursts (CC sweeps, all-notes-off cascades); the worst case MUST fit the CPU budget.
 - Sustain, sostenuto, all-notes-off, and all-sound-off semantics MUST be implemented per the product's instrument/effect contract.
@@ -548,18 +552,32 @@ Rules:
 EXAMPLE:
 
 ```cpp
-void MyProcessor::handleMidi(const juce::MidiBuffer& midi) noexcept
+void MyProcessor::handleMidiInput(const juce::MidiBuffer& midi) noexcept
 {
     for (const auto meta : midi) {
-        const auto& msg    = meta.getMessage();
+        const auto* data   = meta.data;
+        const int   size   = meta.numBytes;
         const int   offset = meta.samplePosition;
 
-        if (msg.isNoteOn())
-            voicePool_.startNote(msg.getNoteNumber(), msg.getFloatVelocity(), offset);
-        else if (msg.isNoteOff())
-            voicePool_.stopNote(msg.getNoteNumber(), offset);
-        else if (msg.isAllNotesOff() || msg.isAllSoundOff())
+        if (data == nullptr || size < 1)
+            continue;
+
+        // Fixed-length MIDI 1.0 channel-message sketch only.
+        // SysEx and MIDI 2.0 require a bounded product-specific parser.
+        if (size >= 3) {
+            const unsigned status = static_cast<unsigned>(data[0] & 0xf0u);
+            const int data1       = static_cast<int>(data[1] & 0x7fu);
+            const int data2       = static_cast<int>(data[2] & 0x7fu);
+
+            if (status == 0x90u && data2 != 0)
+                voicePool_.startNote(data1, static_cast<float>(data2) / 127.0f, offset);
+            else if (status == 0x80u || (status == 0x90u && data2 == 0))
+                voicePool_.stopNote(data1, offset);
+            else if (status == 0xb0u && (data1 == 120 || data1 == 123))
+                voicePool_.releaseAll(offset);
+        } else if (data[0] == 0xfcu || data[0] == 0xffu) {
             voicePool_.releaseAll(offset);
+        }
         // ...
     }
 }
@@ -674,7 +692,7 @@ for (const auto meta : midi) {
         dspCore_.process(makeView(buffer, cursor, offset - cursor));
         cursor = offset;
     }
-    applyMidiEvent(meta.getMessage()); // updates the snapshot atomically
+    applyMidiEvent(meta); // decodes metadata without allocation and updates preallocated state
 }
 if (cursor < numSamples)
     dspCore_.process(makeView(buffer, cursor, numSamples - cursor));
@@ -951,6 +969,13 @@ Bypass behaviour MUST be defined:
 - latency-compensated bypass;
 - tail-preserving bypass;
 - host bypass parameter handling.
+
+JUCE integration rules:
+
+- If the plug-in exposes a bypass parameter, implement `getBypassParameter()` deliberately and keep it consistent with the internal bypass model.
+- Implement and test `processBlockBypassed()` when bypassed processing needs behaviour beyond a host hard-bypass path, such as latency compensation, tail preservation, metering, MIDI handling, or click-free crossfades.
+- Do not assume a host bypass state means the audio callback will stop. The active and bypassed processing paths must both obey the same real-time and MIDI-buffer rules.
+- Bypass code MUST still handle zero-sample blocks and must not drop MIDI/control events.
 
 Avoid clicks on bypass transitions. If the plug-in has latency, bypass MUST NOT create timing discontinuities.
 
@@ -1299,6 +1324,8 @@ Run sanitiser tests on standalone/unit harnesses, not necessarily inside every D
 
 ## 13. CI and release gates
 
+### 13.1 Validation profiles
+
 Every project MUST define CI validation profiles so mandatory release gates are not confused with faster PR feedback. The default profiles are:
 
 | Profile | Trigger | Minimum expectation |
@@ -1374,6 +1401,7 @@ When an agent modifies a JUCE plug-in project, it MUST follow these rules:
 - [ ] No exceptions escape callbacks.
 - [ ] Denormal protection present.
 - [ ] Variable and zero block sizes handled.
+- [ ] Zero-sample blocks still process MIDI/control events before returning from audio processing.
 
 ### Thread and memory safety
 
@@ -1402,6 +1430,9 @@ When an agent modifies a JUCE plug-in project, it MUST follow these rules:
 - [ ] `isBusesLayoutSupported` covers and rejects layouts the DSP does not handle.
 - [ ] `AudioPlayHead` reads handle missing fields and transport jumps.
 - [ ] MIDI iteration uses the modern range-for API and honours `samplePosition`.
+- [ ] MIDI input/output buffer policy is explicit: pass-through, filter, transform, generate, or consume.
+- [ ] MIDI hot paths avoid `MidiMessageMetadata::getMessage()` unless the accepted message set is proven non-allocating.
+- [ ] Bypass behaviour covers `getBypassParameter()`, `processBlockBypassed()`, latency, tails, and MIDI where applicable.
 - [ ] `wrapperType` branches are limited to genuinely format-specific behaviour.
 
 ### Build and release
